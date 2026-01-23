@@ -164,9 +164,11 @@ func (c *Agent) addMessage(source api.MessageSource, messageType api.MessageType
 		Timestamp: time.Now(),
 	}
 
-	// session should always have a ChatMessageStore at this point
-	c.Session.ChatMessageStore.AddChatMessage(message)
-	c.Session.LastModified = time.Now()
+	// Don't store UI control signals - they're not part of the conversation
+	if messageType != api.MessageTypeUserInputRequest {
+		c.Session.ChatMessageStore.AddChatMessage(message)
+		c.Session.LastModified = time.Now()
+	}
 	c.Output <- message
 	return message
 }
@@ -182,7 +184,6 @@ func (c *Agent) setAgentState(newState api.AgentState) {
 		c.Session.LastModified = time.Now()
 	}
 }
-
 func (c *Agent) AgentState() api.AgentState {
 	c.sessionMu.Lock()
 	defer c.sessionMu.Unlock()
@@ -224,6 +225,7 @@ func (s *Agent) Init(ctx context.Context) error {
 			s.Session.LastModified = time.Now()
 		}
 		s.Session.Messages = s.Session.ChatMessageStore.ChatMessages()
+
 	} else {
 		return fmt.Errorf("agent requires a session to be provided")
 	}
@@ -421,11 +423,6 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 				c.currChatContent = []any{initialQuery}
 				c.pendingFunctionCalls = []ToolCallAnalysis{}
 			}
-		} else {
-			if len(c.Session.Messages) == 0 {
-				// Starting new session
-				c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Hey there, what can I help you with today?")
-			}
 		}
 		c.lastErr = nil
 		for {
@@ -453,6 +450,20 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "It has been a pleasure assisting you. Have a great day!")
 						return
 					}
+
+					if sessionPickerResp, ok := userInput.(*api.SessionPickerResponse); ok {
+						if sessionPickerResp.Cancelled {
+							continue
+						}
+						if err := c.LoadSession(sessionPickerResp.SessionID); err != nil {
+							log.Error(err, "error loading session")
+							c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error loading session: "+err.Error())
+						} else {
+							c.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("Switched to session %s", sessionPickerResp.SessionID))
+						}
+						continue
+					}
+
 					query, ok := userInput.(*api.UserInputResponse)
 					if !ok {
 						log.Error(nil, "Received unexpected input from channel", "userInput", userInput)
@@ -480,10 +491,16 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 							close(c.Output)
 							return
 						}
+						// metaquery set up an interactive picker, wait for response
+						if c.AgentState() == api.AgentStateWaitingForInput {
+							continue
+						}
 						// we handled the meta query, so we don't need to run the agentic loop
 						c.setAgentState(api.AgentStateDone)
 						c.pendingFunctionCalls = []ToolCallAnalysis{}
-						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, answer)
+						if answer != "" {
+							c.addMessage(api.MessageSourceAgent, api.MessageTypeText, answer)
+						}
 						continue
 					}
 
@@ -512,37 +529,54 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 						c.addMessage(api.MessageSourceAgent, api.MessageTypeText, "It has been a pleasure assisting you. Have a great day!")
 						return
 					}
-					choiceResponse, ok := userInput.(*api.UserChoiceResponse)
-					if !ok {
-						log.Error(nil, "Received unexpected input from channel", "userInput", userInput)
-						return
-					}
-					dispatchToolCalls := c.handleChoice(ctx, choiceResponse)
-					if dispatchToolCalls {
-						if err := c.DispatchToolCalls(ctx); err != nil {
-							log.Error(err, "error dispatching tool calls")
+
+					switch response := userInput.(type) {
+					case *api.SessionPickerResponse:
+						if response.Cancelled {
 							c.setAgentState(api.AgentStateDone)
-							c.pendingFunctionCalls = []ToolCallAnalysis{}
-							c.Session.LastModified = time.Now()
-							c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
-							// In RunOnce mode, exit on tool execution error
-							if c.RunOnce {
-								c.setAgentState(api.AgentStateExited)
-								c.lastErr = err
-								return
-							}
 							continue
 						}
-						// Clear pending function calls after execution
-						c.pendingFunctionCalls = []ToolCallAnalysis{}
-						c.setAgentState(api.AgentStateRunning)
-						c.currIteration = c.currIteration + 1
-					} else {
-						// if user has declined, we are done with this iteration
-						c.currIteration = c.currIteration + 1
-						c.pendingFunctionCalls = []ToolCallAnalysis{}
-						c.setAgentState(api.AgentStateRunning)
-						c.Session.LastModified = time.Now()
+						if err := c.LoadSession(response.SessionID); err != nil {
+							log.Error(err, "error loading session")
+							c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error loading session: "+err.Error())
+						} else {
+							c.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("Switched to session %s", response.SessionID))
+						}
+						c.setAgentState(api.AgentStateDone)
+						continue
+
+					case *api.UserChoiceResponse:
+						dispatchToolCalls := c.handleChoice(ctx, response)
+						if dispatchToolCalls {
+							if err := c.DispatchToolCalls(ctx); err != nil {
+								log.Error(err, "error dispatching tool calls")
+								c.setAgentState(api.AgentStateDone)
+								c.pendingFunctionCalls = []ToolCallAnalysis{}
+								c.Session.LastModified = time.Now()
+								c.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+								// In RunOnce mode, exit on tool execution error
+								if c.RunOnce {
+									c.setAgentState(api.AgentStateExited)
+									c.lastErr = err
+									return
+								}
+								continue
+							}
+							// Clear pending function calls after execution
+							c.pendingFunctionCalls = []ToolCallAnalysis{}
+							c.setAgentState(api.AgentStateRunning)
+							c.currIteration = c.currIteration + 1
+						} else {
+							// if user has declined, we are done with this iteration
+							c.currIteration = c.currIteration + 1
+							c.pendingFunctionCalls = []ToolCallAnalysis{}
+							c.setAgentState(api.AgentStateRunning)
+							c.Session.LastModified = time.Now()
+						}
+
+					default:
+						log.Error(nil, "Received unexpected input from channel", "userInput", userInput)
+						return
 					}
 				}
 			case api.AgentStateRunning:
@@ -646,6 +680,7 @@ func (c *Agent) Run(ctx context.Context, initialQuery string) error {
 					c.lastErr = llmError
 					continue
 				}
+
 				log.Info("streamedText", "streamedText", streamedText)
 
 				if streamedText != "" {
@@ -817,26 +852,20 @@ func (c *Agent) handleMetaQuery(ctx context.Context, query string) (answer strin
 		return "Saved session as " + savedSessionID, true, nil
 
 	case "sessions":
-		manager, err := sessions.NewSessionManager(c.SessionBackend)
+		sessions, err := c.ListSessions()
 		if err != nil {
-			return "", false, fmt.Errorf("failed to create session manager: %w", err)
+			return "", false, err
 		}
-
-		sessionList, err := manager.ListSessions()
-		if err != nil {
-			return "", false, fmt.Errorf("failed to list sessions: %w", err)
-		}
-		if len(sessionList) == 0 {
+		if len(sessions) == 0 {
 			return "No sessions found.", true, nil
 		}
-
 		// Add ```text so markdown doesn't wreck the format
 		availableSessions := "```text"
 		availableSessions += "Available sessions:\n\n"
 		availableSessions += "ID\t\t\tCreated\t\t\tLast Accessed\t\tModel\t\tProvider\n"
 		availableSessions += "--\t\t\t-------\t\t\t-------------\t\t-----\t\t--------\n"
 
-		for _, session := range sessionList {
+		for _, session := range sessions {
 			availableSessions += fmt.Sprintf("%s\t%s\t%s\t%s\t%s\n",
 				session.ID,
 				session.CreatedAt.Format("2006-01-02 15:04"),
@@ -1022,6 +1051,37 @@ func (c *Agent) LoadSession(sessionID string) error {
 	}
 
 	return nil
+}
+
+// ListSessions returns available sessions for UI pickers
+func (c *Agent) ListSessions() ([]api.SessionInfo, error) {
+	manager, err := sessions.NewSessionManager(c.SessionBackend)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session manager: %w", err)
+	}
+
+	sessionList, err := manager.ListSessions()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list sessions: %w", err)
+	}
+
+	sessionInfos := make([]api.SessionInfo, len(sessionList))
+	for i, session := range sessionList {
+		msgCount := 0
+		if session.ChatMessageStore != nil {
+			msgCount = len(session.ChatMessageStore.ChatMessages())
+		}
+		sessionInfos[i] = api.SessionInfo{
+			ID:           session.ID,
+			Name:         session.Name,
+			ModelID:      session.ModelID,
+			ProviderID:   session.ProviderID,
+			CreatedAt:    session.CreatedAt,
+			LastModified: session.LastModified,
+			MessageCount: msgCount,
+		}
+	}
+	return sessionInfos, nil
 }
 
 func (c *Agent) listModels(ctx context.Context) ([]string, error) {

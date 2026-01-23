@@ -47,14 +47,16 @@ const (
 type MessageType string
 
 const (
-	MessageTypeText               MessageType = "text"
-	MessageTypeError              MessageType = "error"
-	MessageTypeToolCallRequest    MessageType = "tool-call-request"
-	MessageTypeToolCallResponse   MessageType = "tool-call-response"
-	MessageTypeUserInputRequest   MessageType = "user-input-request"
-	MessageTypeUserInputResponse  MessageType = "user-input-response"
-	MessageTypeUserChoiceRequest  MessageType = "user-choice-request"
-	MessageTypeUserChoiceResponse MessageType = "user-choice-response"
+	MessageTypeText                  MessageType = "text"
+	MessageTypeError                 MessageType = "error"
+	MessageTypeToolCallRequest       MessageType = "tool-call-request"
+	MessageTypeToolCallResponse      MessageType = "tool-call-response"
+	MessageTypeUserInputRequest      MessageType = "user-input-request"
+	MessageTypeUserInputResponse     MessageType = "user-input-response"
+	MessageTypeUserChoiceRequest     MessageType = "user-choice-request"
+	MessageTypeUserChoiceResponse    MessageType = "user-choice-response"
+	MessageTypeSessionPickerRequest  MessageType = "session-picker-request"
+	MessageTypeSessionPickerResponse MessageType = "session-picker-response"
 )
 
 type Message struct {
@@ -89,6 +91,28 @@ type UserChoiceResponse struct {
 
 type UserInputResponse struct {
 	Query string `json:"query"`
+}
+
+// SessionPickerRequest is sent to show an interactive session picker
+type SessionPickerRequest struct {
+	Sessions []SessionInfo `json:"sessions"`
+}
+
+// SessionInfo contains display information for a session
+type SessionInfo struct {
+	ID           string    `json:"id"`
+	Name         string    `json:"name,omitempty"`
+	ModelID      string    `json:"modelId,omitempty"`
+	ProviderID   string    `json:"providerId,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+	LastModified time.Time `json:"lastModified"`
+	MessageCount int       `json:"messageCount"`
+}
+
+// SessionPickerResponse is sent when user selects a session
+type SessionPickerResponse struct {
+	SessionID string `json:"sessionId"`
+	Cancelled bool   `json:"cancelled"`
 }
 
 // MCPStatus represents the overall status of MCP servers and tools

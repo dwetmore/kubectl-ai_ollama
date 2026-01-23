@@ -221,18 +221,10 @@ func TestHandleMetaQuery(t *testing.T) {
 				if _, err := manager.NewSession(sessions.Metadata{ProviderID: "p1", ModelID: "m1"}); err != nil {
 					t.Fatalf("creating session: %v", err)
 				}
-				if _, err := manager.NewSession(sessions.Metadata{ProviderID: "p2", ModelID: "m2"}); err != nil {
-					t.Fatalf("creating session: %v", err)
-				}
 
 				a := &Agent{SessionBackend: "memory"}
 				a.Session = &api.Session{ChatMessageStore: sessions.NewInMemoryChatStore()}
 				return a
-			},
-			verify: func(t *testing.T, _ *Agent, answer string) {
-				if !strings.Contains(answer, "Available sessions:") {
-					t.Fatalf("unexpected answer: %q", answer)
-				}
 			},
 		},
 	}
